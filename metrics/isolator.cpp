@@ -382,10 +382,31 @@ public:
   virtual Future<Nothing> cleanup(
       const ContainerID& containerId)
   {
-    // Let the metrics service know about the container being
-    // destroyed via an HTTP request. On any errors, return an
-    // `Failure()`.
-    return Nothing();
+    return sendContainerStop(containerId)
+      .onAny(defer(
+          self(),
+          [=](const Future<http::Response>& response) -> Future<http::Response> {
+            if (!response.isReady()) {
+              return Failure("Failed posting container DELETE request for"
+                             " container '" + containerId.value() + "': " +
+                             (response.isFailed() ?
+                                 response.failure() : "Future discarded"));
+            }
+
+            return response.get();
+          }))
+      .then(defer(
+          self(),
+          [=](const http::Response& response) -> Future<Nothing> {
+            if (response.code != http::Status::ACCEPTED) {
+              return Failure("Received unexpected response code "
+                             " '" + stringify(response.code) + "' when"
+                             " posting 'containerStartRequest' for container"
+                             " '" + containerId.value() + "'");
+            }
+
+            return Nothing();
+          }));
   }
 
   Future<http::Connection> connect() {
