@@ -283,17 +283,81 @@ public:
           }));
   }
 
+  // Let the metrics service know about the container being launched.
+  // In the response, grab the STATSD_UDP_HOST and STATSD_UDP_PORT
+  // pair being returned and set it in the environment of the
+  // `ContainerLaunchInfo` returned from this function.
   virtual Future<Option<ContainerLaunchInfo>> prepare(
       const ContainerID& containerId,
       const slave::ContainerConfig& containerConfig)
   {
-    // Let the metrics service know about the container being
-    // launched via an HTTP request. In the response, grab the
-    // STATSD_UDP_HOST and STATSD_UDP_PORT pair being returned and set
-    // it in the environment of the `ContainerLaunchInfo` returned
-    // from this function. On any errors, return a `Failure()`.
-    ContainerLaunchInfo launchInfo;
-    return launchInfo;
+    ContainerStartRequest containerStartRequest;
+    containerStartRequest.set_container_id(containerId.value());
+
+    return send(containerStartRequest)
+      .onAny(defer(
+        self(),
+        [=](const Future<http::Response>& response) -> Future<http::Response> {
+          if (!response.isReady()) {
+            return Failure("Error posting 'containerStartRequest' for"
+                           " container '" + containerId.value() + "': " +
+                           (response.isFailed() ?
+                               response.failure() : "Future discarded"));
+          }
+
+          return response.get();
+        }))
+      .then(defer(
+        self(),
+        [=](const http::Response& response)
+          -> Future<Option<ContainerLaunchInfo>> {
+          if (response.code == http::Status::NO_CONTENT) {
+            return None();
+          }
+
+          if (response.code != http::Status::CREATED) {
+            return Failure("Received unexpected response code "
+                           " '" + stringify(response.code) + "' when"
+                           " posting 'containerStartRequest' for container"
+                           " '" + containerId.value() + "'");
+          }
+
+          Try<ContainerStartResponse> containerStartResponse =
+            parse<ContainerStartResponse>(response.body);
+          if (containerStartResponse.isError()) {
+            return Failure("Error parsing the 'ContainerStartResponse' body for"
+                           " container '" + containerId.value() + "': " +
+                           containerStartResponse.error());
+          }
+
+          // TODO(klueska): For now, we require both `statsd_host` and
+          // `statsd_port` to be set. This may not be true in the future.
+          // We need to revisit this if/when this changes.
+          if (!containerStartResponse->has_statsd_host() ||
+              !containerStartResponse->has_statsd_port()) {
+            const string message = containerStartResponse.isError()
+              ? containerStartResponse.error()
+              : string();
+
+            return Failure("Missing 'statsd_host' or 'statsd_port' field in"
+                           " 'containerStartResponse' for container"
+                           " '" + containerId.value() + "': " + message);
+          }
+
+          Environment environment;
+          Environment::Variable* variable;
+          variable = environment.add_variables();
+          variable->set_name("STATSD_UDP_HOST");
+          variable->set_value(containerStartResponse->statsd_host());
+          variable = environment.add_variables();
+          variable->set_name("STATSD_UDP_PORT");
+          variable->set_value(stringify(containerStartResponse->statsd_port()));
+
+          ContainerLaunchInfo launchInfo;
+          launchInfo.mutable_environment()->CopyFrom(environment);
+
+          return launchInfo;
+        }));
   }
 
   virtual Future<Nothing> cleanup(
