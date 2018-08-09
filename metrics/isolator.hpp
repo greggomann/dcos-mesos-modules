@@ -17,12 +17,32 @@
 #include <stout/duration.hpp>
 #include <stout/flags.hpp>
 #include <stout/hashset.hpp>
+#include <stout/json.hpp>
 #include <stout/option.hpp>
 #include <stout/try.hpp>
+
+#include <stout/flags/parse.hpp>
 
 namespace mesosphere {
 namespace dcos {
 namespace metrics {
+
+template<typename T>
+Try<T> parse(const std::string& body)
+{
+  Try<JSON::Object> json = flags::parse<JSON::Object>(body);
+  if (json.isError()) {
+    return Error("Error parsing input as JSON: " + json.error());
+  }
+
+  Try<T> response = ::protobuf::parse<T>(json.get());
+  if (response.isError()) {
+    return Error(
+        "Error parsing JSON into protobuf: " + response.error());
+  }
+
+  return response.get();
+}
 
 // Forward declaration.
 class MetricsIsolatorProcess;
