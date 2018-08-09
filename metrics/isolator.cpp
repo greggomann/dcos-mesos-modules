@@ -41,6 +41,12 @@ using mesos::slave::ContainerLaunchInfo;
 using mesos::slave::ContainerState;
 using mesos::slave::Isolator;
 
+using mesos::modules::metrics::ContainerStartRequest;
+using mesos::modules::metrics::ContainerStartResponse;
+using mesos::modules::metrics::ContainerStopRequest;
+using mesos::modules::metrics::ContainerStopResponse;
+using mesos::modules::metrics::LegacyState;
+
 namespace mesosphere {
 namespace dcos {
 namespace metrics {
