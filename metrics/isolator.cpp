@@ -2,6 +2,7 @@
 #include <string>
 #include <vector>
 
+#include <mesos/http.hpp>
 #include <mesos/mesos.hpp>
 #include <mesos/module.hpp>
 
@@ -15,6 +16,7 @@
 #include <stout/assert.hpp>
 #include <stout/hashset.hpp>
 #include <stout/ip.hpp>
+#include <stout/json.hpp>
 #include <stout/nothing.hpp>
 #include <stout/numify.hpp>
 #include <stout/option.hpp>
@@ -22,6 +24,8 @@
 #include <stout/path.hpp>
 #include <stout/strings.hpp>
 #include <stout/try.hpp>
+
+#include <stout/flags/parse.hpp>
 
 #include "isolator.hpp"
 
@@ -48,6 +52,31 @@ using mesos::modules::metrics::LegacyState;
 namespace mesosphere {
 namespace dcos {
 namespace metrics {
+
+namespace internal {
+
+// TODO(greggomann): Make use of `mesos::internal::serialize` when we get
+// access to 'common/http.hpp' from the Mesos codebase.
+string serialize(
+    ContentType contentType,
+    const google::protobuf::Message& message)
+{
+  switch (contentType) {
+    case ContentType::PROTOBUF: {
+      return message.SerializeAsString();
+    }
+    case ContentType::JSON: {
+      return jsonify(JSON::Protobuf(message));
+    }
+    case ContentType::RECORDIO: {
+      LOG(FATAL) << "Serializing a RecordIO stream is not supported";
+    }
+  }
+
+  UNREACHABLE();
+}
+
+} // namespace internal {
 
 class MetricsIsolatorProcess
   : public process::Process<MetricsIsolatorProcess>
@@ -146,6 +175,86 @@ public:
     // destroyed via an HTTP request. On any errors, return an
     // `Failure()`.
     return Nothing();
+  }
+
+  Future<http::Connection> connect() {
+    if (serviceInetAddress.isSome()) {
+      if (flags.service_scheme.get() == "http") {
+        return http::connect(serviceInetAddress.get(), http::Scheme::HTTP);
+      }
+      return http::connect(serviceInetAddress.get(), http::Scheme::HTTPS);
+    }
+
+    if (serviceUnixAddress.isSome()) {
+      if (flags.service_scheme.get() == "http") {
+        return http::connect(serviceUnixAddress.get(), http::Scheme::HTTP);
+      }
+      return http::connect(serviceUnixAddress.get(), http::Scheme::HTTPS);
+    }
+
+    UNREACHABLE();
+  }
+
+  Future<http::Response> send(
+      const string& endpoint,
+      const Option<string>& body,
+      const string& method)
+  {
+    return connect()
+      .then(defer(
+          self(),
+          [=](http::Connection connection) -> Future<http::Response> {
+            // Capture a reference to the connection to ensure that it remains
+            // open long enough to receive the response.
+            connection.disconnected()
+              .onAny([connection]() {});
+
+            http::Request request;
+            request.method = method;
+            request.keepAlive = true;
+            request.headers = {
+              {"Accept", APPLICATION_JSON},
+              {"Content-Type", APPLICATION_JSON}};
+
+            if (body.isSome()) {
+              request.body = body.get();
+            }
+
+            if (serviceInetAddress.isSome()) {
+              request.url = http::URL(
+                  serviceScheme,
+                  serviceInetAddress->ip,
+                  serviceInetAddress->port,
+                  endpoint);
+            }
+
+            if (serviceUnixAddress.isSome()) {
+              request.url.scheme = serviceScheme;
+              request.url.domain = "";
+              request.url.path = endpoint;
+            }
+
+            return connection.send(request);
+          }))
+      .after(
+          flags.request_timeout,
+          [](const Future<http::Response>&) {
+            return Failure("Request timed out");
+          });
+  }
+
+  Future<http::Response> send(const ContainerStartRequest& containerStartRequest)
+  {
+    string body = mesosphere::dcos::metrics::internal::serialize(
+        ContentType::JSON,
+        containerStartRequest);
+
+    return send(serviceEndpoint, body, "POST");
+  }
+
+  Future<http::Response> sendContainerStop(const ContainerID& containerId)
+  {
+    return send(serviceEndpoint + "/" + containerId.value(), None(), "DELETE");
   }
 
 private:
