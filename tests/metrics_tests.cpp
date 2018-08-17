@@ -229,6 +229,490 @@ private:
   const string statePath;
 };
 
+
+// When the isolator's `prepare()` method is called with a container ID, it
+// should make an API call to the metrics service to retrieve the metrics port
+// for that container, and then inject the correct host and port into the
+// environment contained in the returned `ContainerLaunchInfo`.
+TEST_F(MetricsTest, PrepareSuccess)
+{
+  MockMetricsService metricsService;
+
+  ContainerStartResponse responseBody;
+  responseBody.set_statsd_port(1111);
+  responseBody.set_statsd_host("127.0.0.1");
+
+  process::http::Response response(
+      string(jsonify(JSON::Protobuf(responseBody))),
+      process::http::Status::CREATED,
+      "application/json");
+
+  Future<process::http::Request> request;
+  EXPECT_CALL(*metricsService.mock, container(_))
+    .WillOnce(DoAll(FutureArg<0>(&request),
+                    Return(response)));
+
+  const string CONTAINER_ID = "new-container";
+
+  ContainerID containerId;
+  containerId.set_value(CONTAINER_ID);
+
+  Future<Option<mesos::slave::ContainerLaunchInfo>> prepared =
+    isolator->prepare(containerId, mesos::slave::ContainerConfig());
+
+  AWAIT_READY(request);
+
+  // Verify the contents of the module's request.
+  Try<ContainerStartRequest> requestBody =
+    parse<ContainerStartRequest>(request->body);
+
+  ASSERT_SOME(requestBody);
+  ASSERT_EQ(request->method, "POST");
+  ASSERT_FALSE(requestBody->has_statsd_host());
+  ASSERT_FALSE(requestBody->has_statsd_port());
+  ASSERT_EQ(requestBody->container_id(), CONTAINER_ID);
+
+  AWAIT_READY(prepared);
+
+  // Check that the `ContainerLaunchInfo` contains environment variables.
+  ASSERT_SOME(prepared.get());
+  ASSERT_TRUE(prepared.get()->has_environment());
+  ASSERT_GT(prepared.get()->environment().variables().size(), 0);
+
+  // Verify the contents of the returned environment.
+  hashmap<string, string> expectedEnvironment =
+    {{"STATSD_UDP_HOST", "127.0.0.1"},
+     {"STATSD_UDP_PORT", "1111"}};
+
+  foreach (const Environment::Variable& variable,
+           prepared.get()->environment().variables()) {
+    ASSERT_EQ(variable.type(), Environment::Variable::VALUE);
+    ASSERT_TRUE(variable.has_value());
+    ASSERT_EQ(variable.value(), expectedEnvironment[variable.name()]);
+  }
+}
+
+
+// When the isolator's `prepare()` method is called and the metrics service
+// returns a response which does not contain a port, the isolator should return
+// a failed future.
+TEST_F(MetricsTest, PrepareFailureNoPort)
+{
+  MockMetricsService metricsService;
+
+  ContainerStartResponse responseBody;
+  responseBody.set_statsd_host("127.0.0.1");
+
+  process::http::Response response(
+      string(jsonify(JSON::Protobuf(responseBody))),
+      process::http::Status::CREATED,
+      "application/json");
+
+  EXPECT_CALL(*metricsService.mock, container(_))
+    .WillOnce(Return(response));
+
+  const string CONTAINER_ID = "new-container";
+
+  ContainerID containerId;
+  containerId.set_value(CONTAINER_ID);
+
+  Future<Option<mesos::slave::ContainerLaunchInfo>> prepared =
+    isolator->prepare(containerId, mesos::slave::ContainerConfig());
+
+  AWAIT_FAILED(prepared);
+}
+
+
+// When the isolator's `prepare()` method is called and the metrics service
+// returns a response code other than 201 CREATED, the isolator should return
+// a failed future.
+TEST_F(MetricsTest, PrepareFailureUnexpectedStatusCode)
+{
+  MockMetricsService metricsService;
+
+  ContainerStartResponse responseBody;
+  responseBody.set_statsd_port(1111);
+  responseBody.set_statsd_host("127.0.0.1");
+
+  process::http::Response response(
+      string(jsonify(JSON::Protobuf(responseBody))),
+      process::http::Status::OK,
+      "application/json");
+
+  EXPECT_CALL(*metricsService.mock, container(_))
+    .WillOnce(Return(response));
+
+  const string CONTAINER_ID = "new-container";
+
+  ContainerID containerId;
+  containerId.set_value(CONTAINER_ID);
+
+  Future<Option<mesos::slave::ContainerLaunchInfo>> prepared =
+    isolator->prepare(containerId, mesos::slave::ContainerConfig());
+
+  AWAIT_FAILED(prepared);
+}
+
+
+// When the isolator's `prepare()` method is called and the metrics service
+// doesn't return a response within the configured request timeout, the isolator
+// should return a failed future.
+TEST_F(MetricsTest, PrepareFailureRequestTimeout)
+{
+  Clock::pause();
+
+  MockMetricsService metricsService;
+
+  ContainerStartResponse responseBody;
+  responseBody.set_statsd_port(1111);
+  responseBody.set_statsd_host("127.0.0.1");
+
+  Future<process::http::Response> response;
+
+  Future<Nothing> requestSent;
+  EXPECT_CALL(*metricsService.mock, container(_))
+    .WillOnce(DoAll(FutureSatisfy(&requestSent),
+                    Return(response)));
+
+  const string CONTAINER_ID = "new-container";
+
+  ContainerID containerId;
+  containerId.set_value(CONTAINER_ID);
+
+  Future<Option<mesos::slave::ContainerLaunchInfo>> prepared =
+    isolator->prepare(containerId, mesos::slave::ContainerConfig());
+
+  AWAIT_READY(requestSent);
+
+  ASSERT_TRUE(prepared.isPending());
+
+  Clock::advance(REQUEST_TIMEOUT);
+  Clock::settle();
+
+  ASSERT_TRUE(prepared.isFailed());
+}
+
+
+// When the isolator's `cleanup()` method is called and the module receives a
+// 202 ACCEPTED response from the metrics service, the isolator should return a
+// ready future.
+TEST_F(MetricsTest, CleanupSuccess)
+{
+  MockMetricsService metricsService;
+
+  process::http::Response response(process::http::Status::ACCEPTED);
+
+  Future<process::http::Request> request;
+  EXPECT_CALL(*metricsService.mock, container(_))
+    .WillOnce(DoAll(FutureArg<0>(&request),
+                    Return(response)));
+
+  const string CONTAINER_ID = "new-container";
+
+  ContainerID containerId;
+  containerId.set_value(CONTAINER_ID);
+
+  Future<Nothing> cleanedup = isolator->cleanup(containerId);
+
+  AWAIT_READY(request);
+
+  ASSERT_EQ(request->method, "DELETE");
+
+  // Verify that the DELETE request is made for a path which reflects the
+  // target container's ID.
+  const vector<string> pathTokens = strings::tokenize(request->url.path, "/");
+
+  ASSERT_EQ(pathTokens.size(), 3);
+  ASSERT_EQ(pathTokens[2], CONTAINER_ID);
+
+  AWAIT_READY(cleanedup);
+}
+
+
+// When the isolator's `cleanup()` method is called and the module receives an
+// unexpected response code from the metrics service, the isolator should return
+// a failed future.
+TEST_F(MetricsTest, CleanupFailureUnexpectedStatusCode)
+{
+  MockMetricsService metricsService;
+
+  process::http::Response response(process::http::Status::OK);
+
+  EXPECT_CALL(*metricsService.mock, container(_))
+    .WillOnce(Return(response));
+
+  const string CONTAINER_ID = "new-container";
+
+  ContainerID containerId;
+  containerId.set_value(CONTAINER_ID);
+
+  Future<Nothing> cleanedup = isolator->cleanup(containerId);
+
+  AWAIT_FAILED(cleanedup);
+}
+
+
+// When the isolator's `recover()` method is called and it finds legacy state
+// on disk, it should make API requests to the metrics service to transfer
+// ownership of the checkpointed container metrics state.
+TEST_F(MetricsTest, RecoverSuccessWithLegacyState)
+{
+  MockMetricsService metricsService;
+
+  const hashmap<string, int> containers =
+    {{"container1", 1234}, {"container2", 5678}};
+
+  LegacyStateStore stateStore(containers, statePath);
+
+  // Check that the container state directory exists. We will confirm that it
+  // has been moved after recovery.
+  ASSERT_TRUE(os::exists(path::join(statePath, "containers")));
+
+  // In the recovery case, the metrics module doesn't use the returned host and
+  // port for anything. We inject some dummy values here to avoid addressing the
+  // fact that the order in which the requests is made is not certain.
+  ContainerStartResponse responseBody;
+  responseBody.set_statsd_host("127.0.0.1");
+  responseBody.set_statsd_port(1234);
+
+  process::http::Response response(
+      string(jsonify(JSON::Protobuf(responseBody))),
+      process::http::Status::CREATED,
+      "application/json");
+
+  Future<process::http::Request> request1;
+  Future<process::http::Request> request2;
+  EXPECT_CALL(*metricsService.mock, container(_))
+    .WillOnce(DoAll(FutureArg<0>(&request1),
+                    Return(response)))
+    .WillOnce(DoAll(FutureArg<0>(&request2),
+                    Return(response)));
+
+  // Construct the agent's recovered state, which is passed
+  // into the module's `recover()` method.
+  vector<mesos::slave::ContainerState> agentState;
+
+  foreachkey (const string& containerId_, containers) {
+    ContainerID containerId;
+    containerId.set_value(containerId_);
+
+    mesos::slave::ContainerState containerState;
+
+    containerState.mutable_container_id()->CopyFrom(containerId);
+    containerState.set_pid(0);
+    containerState.set_directory(os::getcwd());
+
+    agentState.push_back(containerState);
+  }
+
+  Future<Nothing> recovered = isolator->recover(agentState, {});
+
+  // Verify the contents of the module's requests.
+  vector<Future<process::http::Request>> requests{request1, request2};
+  foreach (const Future<process::http::Request>& request, requests) {
+    AWAIT_READY(request);
+
+    Try<ContainerStartRequest> requestBody =
+      parse<ContainerStartRequest>(request->body);
+
+    ASSERT_SOME(requestBody);
+    ASSERT_EQ(request->method, "POST");
+
+    ASSERT_TRUE(requestBody->has_statsd_host());
+    ASSERT_EQ(requestBody->statsd_host(), LEGACY_HOST);
+
+    ASSERT_TRUE(requestBody->has_statsd_port());
+    ASSERT_TRUE(containers.contains(requestBody->container_id()));
+    ASSERT_EQ(
+        requestBody->statsd_port(),
+        containers.at(requestBody->container_id()));
+  }
+
+  AWAIT_READY(recovered);
+
+  ASSERT_FALSE(os::exists(statePath));
+}
+
+
+// When the isolator's `recover()` method is called, the legacy state directory
+// has been set in the module configuration, but the state directory does not
+// exist, then the module should return a ready future.
+TEST_F(MetricsTest, RecoverSuccessWithoutLegacyDirectory)
+{
+  Clock::pause();
+
+  MockMetricsService metricsService;
+
+  os::rm(statePath);
+
+  EXPECT_CALL(*metricsService.mock, container(_))
+    .Times(0);
+
+  vector<mesos::slave::ContainerState> agentState;
+
+  Future<Nothing> recovered = isolator->recover(agentState, {});
+
+  AWAIT_READY(recovered);
+
+  // Settle the clock to ensure that the metrics API is not called.
+  Clock::settle();
+}
+
+
+// When the isolator's `recover()` method is called, the legacy state directory
+// has been set in the module configuration, the state directory exists, no
+// recovered containers are passed to the module, and the state directory is
+// empty as expected, then the module should return a ready future.
+TEST_F(MetricsTest, RecoverSuccessNoLegacyState)
+{
+  MockMetricsService metricsService;
+
+  EXPECT_CALL(*metricsService.mock, container(_))
+    .Times(0);
+
+  vector<mesos::slave::ContainerState> agentState;
+
+  Future<Nothing> recovered = isolator->recover(agentState, {});
+
+  AWAIT_READY(recovered);
+}
+
+
+// When the isolator's `recover()` method is called, the legacy state directory
+// has been set in the module configuration, the state directory exists,
+// recovered containers are passed to the module by the agent, but the state
+// directory is unexpectedly empty, the module should return a failed future.
+TEST_F(MetricsTest, RecoverFailureMissingLegacyState)
+{
+  Clock::pause();
+
+  MockMetricsService metricsService;
+
+  EXPECT_CALL(*metricsService.mock, container(_))
+    .Times(0);
+
+  vector<mesos::slave::ContainerState> agentState;
+
+  ContainerID containerId;
+  containerId.set_value("recovered-container");
+
+  mesos::slave::ContainerState containerState;
+
+  containerState.mutable_container_id()->CopyFrom(containerId);
+  containerState.set_pid(0);
+  containerState.set_directory(os::getcwd());
+
+  agentState.push_back(containerState);
+
+  Future<Nothing> recovered = isolator->recover(agentState, {});
+
+  AWAIT_FAILED(recovered);
+
+  // Settle the clock to ensure that the metrics API is not called.
+  Clock::settle();
+}
+
+
+// When the isolator's `recover()` method is called and it finds legacy state
+// on disk and subsequent requests to the metrics API return an unexpected
+// status code, it should return a failed future.
+TEST_F(MetricsTest, RecoverFailureUnexpectedStatusCode)
+{
+  MockMetricsService metricsService;
+
+  const hashmap<string, int> containers = {{"container1", 1234}};
+
+  LegacyStateStore stateStore(containers, statePath);
+
+  // Check that the container state directory exists. We will confirm that it
+  // still exists after recovery fails.
+  ASSERT_TRUE(os::exists(path::join(statePath, "containers")));
+
+  process::http::Response response(process::http::Status::OK);
+
+  ContainerStartResponse responseBody;
+  response.body = string(jsonify(JSON::Protobuf(responseBody)));
+
+  Future<process::http::Request> request;
+  EXPECT_CALL(*metricsService.mock, container(_))
+    .WillOnce(DoAll(FutureArg<0>(&request),
+                    Return(response)));
+
+  // Construct the agent's recovered state, which is passed
+  // into the module's `recover()` method.
+  vector<mesos::slave::ContainerState> agentState;
+
+  foreachkey (const string& containerId_, containers) {
+    ContainerID containerId;
+    containerId.set_value(containerId_);
+
+    mesos::slave::ContainerState containerState;
+
+    containerState.mutable_container_id()->CopyFrom(containerId);
+    containerState.set_pid(0);
+    containerState.set_directory(os::getcwd());
+
+    agentState.push_back(containerState);
+  }
+
+  Future<Nothing> recovered = isolator->recover(agentState, {});
+
+  AWAIT_FAILED(recovered);
+
+  ASSERT_TRUE(os::exists(path::join(statePath, "containers")));
+}
+
+
+// When the isolator's `prepare()` method is called and the metrics service
+// returns a 409 CONFLICT response, the isolator should return a failed future
+// with an error message that notifies the operator that the recovered port is
+// not available.
+TEST_F(MetricsTest, RecoverFailurePortNotAvailable)
+{
+  MockMetricsService metricsService;
+
+  const int port = 1234;
+  const hashmap<string, int> containers = {{"container1", port}};
+
+  LegacyStateStore stateStore(containers, statePath);
+
+  // Check that the container state directory exists. We will confirm that it
+  // still exists after recovery fails.
+  ASSERT_TRUE(os::exists(path::join(statePath, "containers")));
+
+  process::http::Response response(process::http::Status::CONFLICT);
+
+  Future<process::http::Request> request;
+  EXPECT_CALL(*metricsService.mock, container(_))
+    .WillOnce(DoAll(FutureArg<0>(&request),
+                    Return(response)));
+
+  // Construct the agent's recovered state, which is passed
+  // into the module's `recover()` method.
+  vector<mesos::slave::ContainerState> agentState;
+
+  foreachkey (const string& containerId_, containers) {
+    ContainerID containerId;
+    containerId.set_value(containerId_);
+
+    mesos::slave::ContainerState containerState;
+
+    containerState.mutable_container_id()->CopyFrom(containerId);
+    containerState.set_pid(0);
+    containerState.set_directory(os::getcwd());
+
+    agentState.push_back(containerState);
+  }
+
+  Future<Nothing> recovered = isolator->recover(agentState, {});
+
+  AWAIT_FAILED(recovered);
+
+  ASSERT_TRUE(strings::contains(recovered.failure(), stringify(port)));
+
+  ASSERT_TRUE(os::exists(path::join(statePath, "containers")));
+}
+
 } // namespace tests {
 } // namespace metrics {
 } // namespace mesos {
