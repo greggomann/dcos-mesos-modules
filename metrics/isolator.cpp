@@ -47,8 +47,6 @@ using mesos::slave::Isolator;
 
 using mesos::modules::metrics::ContainerStartRequest;
 using mesos::modules::metrics::ContainerStartResponse;
-using mesos::modules::metrics::ContainerStopRequest;
-using mesos::modules::metrics::ContainerStopResponse;
 using mesos::modules::metrics::LegacyState;
 
 namespace mesosphere {
@@ -138,11 +136,9 @@ public:
     serviceEndpoint = flags.service_endpoint.get();
 
     // Set `legacyStateDir` based on flags.
-    ASSERT(flags.legacy_state_path_dir.isSome());
-
-    string path = path::join(flags.legacy_state_path_dir.get(), "containers");
-    if (os::exists(path)) {
-      legacyStateDir = path;
+    if (flags.legacy_state_path_dir.isSome()) {
+      legacyStateDir =
+        path::join(flags.legacy_state_path_dir.get(), "containers");
     }
   }
 
@@ -154,6 +150,13 @@ public:
   {
     // If there is no `legacyStateDir`, we are done.
     if (legacyStateDir.isNone()) {
+      return Nothing();
+    }
+
+    // If the legacy state directory has been set in the configuration but the
+    // directory is not found, then we assume recovery was previously completed
+    // successfully. Return successfully in this case.
+    if (!os::exists(legacyStateDir.get())) {
       return Nothing();
     }
 
@@ -169,33 +172,34 @@ public:
       containers.push_back(container);
     }
 
-    // Look through all of the recovered containers and see if legacy
-    // metrics state for it exists. If it does, send the DC/OS metrics
-    // service a `ContainerStart` message containing the existing
-    // StatsD UDP host:port pair for the container.
+    // Look through all of the recovered containers and see if legacy metrics
+    // state for them exists. If it does, send the DC/OS metrics service a
+    // `ContainerStart` message containing the existing StatsD UDP host:port
+    // pair for the container. If it doesn't, fail recovery.
+
     vector<Future<Nothing>> futures;
 
     foreach(const ContainerID& container, containers) {
       string statePath = path::join(legacyStateDir.get(), container.value());
       if (!os::exists(statePath)) {
-        LOG(ERROR) << "Metrics isolator was told to recover container '"
-                   << container << "' but the path '" << statePath
-                   << "' could not be found";
-        continue;
+        return Failure(
+            "Metrics isolator was told to recover container '" +
+            container.value() + "' but the legacy state path '" +
+            statePath + "' could not be found");
       }
 
       Try<std::string> read = os::read(statePath);
       if (read.isError()) {
-        LOG(ERROR) << "Error reading the legacy state path"
-                   << " '" << statePath << "': " << read.error();
-        continue;
+        return Failure(
+            "Error reading the legacy state path '" + statePath +
+            "': " + read.error());
       }
 
       Try<LegacyState> legacyState = parse<LegacyState>(read.get());
       if (legacyState.isError()) {
-        LOG(ERROR) << "Error parsing the legacy state at"
-                   << " '" << statePath << "': " << legacyState.error();
-        continue;
+        return Failure(
+            "Error parsing the legacy state at '" + statePath +
+            "': " + legacyState.error());
       }
 
       ContainerStartRequest containerStartRequest;
@@ -219,53 +223,52 @@ public:
         .then(defer(
           self(),
           [=](const http::Response& response) -> Future<Nothing> {
-            if (response.code != http::Status::CREATED) {
-              return Failure("Received unexpected response code "
-                             " '" + stringify(response.code) + "' when"
-                             " posting 'containerStartRequest' for container"
-                             " '" + container.value() + "'" +
-                             (response.body == "" ? "" : ": " + response.body));
+            if (response.code == http::Status::CREATED) {
+              Try<ContainerStartResponse> containerStartResponse =
+                parse<ContainerStartResponse>(response.body);
+              if (containerStartResponse.isError()) {
+                return Failure("Error parsing the 'ContainerStartResponse' body"
+                               " for container '" + container.value() + "': " +
+                               containerStartResponse.error());
+              }
+
+              if (containerStartResponse->has_statsd_host() &&
+                  containerStartResponse->has_statsd_port()) {
+                LOG(INFO) << "Successfully recovered StatsD metrics gathering for"
+                          << " container '" << container.value() << "' on"
+                          << " '" << containerStartResponse->statsd_host() << ":"
+                          << containerStartResponse->statsd_port() << "'";
+              } else {
+                LOG(ERROR) << "Received expected status code from metrics"
+                           << " service while recovering container '"
+                           << container << "', but either 'statsd_host' or"
+                           << " 'statsd_port' was not set in the response";
+              }
+
+              return Nothing();
+            } else if (response.code == http::Status::SEE_OTHER) {
+              LOG(INFO) << "Attempted recovery of StatsD metrics gathering for"
+                        << " container '" << container.value() << "'; response"
+                        << " indicates that recovery was already completed"
+                        << " successfully for that container";
+
+              return Nothing();
             }
 
-            Try<ContainerStartResponse> containerStartResponse =
-              parse<ContainerStartResponse>(response.body);
-            if (containerStartResponse.isError()) {
-              return Failure("Error parsing the 'ContainerStartResponse' body"
-                             " for container '" + container.value() + "': " +
-                             containerStartResponse.error());
-            }
-
-            if (containerStartResponse->has_statsd_host() &&
-                containerStartResponse->has_statsd_port()) {
-              LOG(INFO) << "Successfully recovered StatsD metrics gathering for"
-                        << " container '" << container.value() << "' on"
-                        << " '" << containerStartResponse->statsd_host() << ":"
-                        << containerStartResponse->statsd_port() << "'";
-            } else {
-              LOG(ERROR) << "Received expected status code from metrics"
-                         << " service while recovering container '"
-                         << container << "', but either 'statsd_host' or"
-                         << " 'statsd_port' was not set in the response";
-            }
-
-            return Nothing();
+            return Failure("Received unexpected response code "
+                           " '" + stringify(response.code) + "' when"
+                           " posting 'containerStartRequest' for container"
+                           " '" + container.value() + "'" +
+                           (response.body == "" ? "" : ": " + response.body));
           }));
 
       futures.push_back(future);
     }
 
-    return await(futures)
+    return collect(futures)
       .then(defer(
           self(),
-          [=](const vector<Future<Nothing>>& futures) {
-            // Log any errors that occurred while recovering the
-            // legacy state of each container.
-            foreach(const Future<Nothing>& future, futures) {
-              if (future.isFailed()) {
-                LOG(ERROR) << future.failure();
-              }
-            }
-
+          [=](const vector<Nothing>& results) {
             // Once all state has been recovered, move the legacy state
             // directory to a new location so that it isn't touched again on
             // the next recovery. We don't delete it, just in case there is a
@@ -363,15 +366,12 @@ public:
   virtual Future<Nothing> cleanup(
       const ContainerID& containerId)
   {
-    ContainerStopRequest containerStopRequest;
-    containerStopRequest.set_container_id(containerId.value());
-
-    return send(containerStopRequest)
+    return sendContainerStop(containerId)
       .onAny(defer(
           self(),
           [=](const Future<http::Response>& response) -> Future<http::Response> {
             if (!response.isReady()) {
-              return Failure("Failed posting 'containerStopRequest' for"
+              return Failure("Failed posting container DELETE request for"
                              " container '" + containerId.value() + "': " +
                              (response.isFailed() ?
                                  response.failure() : "Future discarded"));
@@ -411,7 +411,10 @@ public:
     UNREACHABLE();
   }
 
-  Future<http::Response> send(const string& body, const string& method)
+  Future<http::Response> send(
+      const string& endpoint,
+      const Option<string>& body,
+      const string& method)
   {
     return connect()
       .then(defer(
@@ -428,20 +431,23 @@ public:
             request.headers = {
               {"Accept", APPLICATION_JSON},
               {"Content-Type", APPLICATION_JSON}};
-            request.body = body;
+
+            if (body.isSome()) {
+              request.body = body.get();
+            }
 
             if (serviceInetAddress.isSome()) {
               request.url = http::URL(
                   serviceScheme,
                   serviceInetAddress->ip,
                   serviceInetAddress->port,
-                  serviceEndpoint);
+                  endpoint);
             }
 
             if (serviceUnixAddress.isSome()) {
               request.url.scheme = serviceScheme;
               request.url.domain = "";
-              request.url.path = serviceEndpoint;
+              request.url.path = endpoint;
             }
 
             return connection.send(request);
@@ -459,17 +465,12 @@ public:
         ContentType::JSON,
         containerStartRequest);
 
-    return send(body, "POST");
+    return send(serviceEndpoint, body, "POST");
   }
 
-
-  Future<http::Response> send(const ContainerStopRequest& containerStopRequest)
+  Future<http::Response> sendContainerStop(const ContainerID& containerId)
   {
-    string body = mesosphere::dcos::metrics::internal::serialize(
-        ContentType::JSON,
-        containerStopRequest);
-
-    return send(body, "DELETE");
+    return send(serviceEndpoint + "/" + containerId.value(), None(), "DELETE");
   }
 
 private:

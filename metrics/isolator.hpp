@@ -119,11 +119,7 @@ struct Flags : virtual flags::FlagsBase
         "The path where the STATSD_UDP_HOST and STATSD_UDP_PORT\n"
         "of a task were persisted by the legacy module.",
         [](const Option<std::string>& value) -> Option<Error> {
-          if (value.isNone()) {
-            return Error("Missing required option --legacy_state_path_dir");
-          }
-
-          if (!path::absolute(value.get())) {
+          if (value.isSome() && !path::absolute(value.get())) {
             return Error(
                 "Expected --legacy_state_path_dir to be an absolute path");
           }

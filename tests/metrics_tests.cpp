@@ -69,7 +69,7 @@ namespace metrics {
 namespace tests {
 
 const string METRICS_PROCESS = "metrics-service";
-const string API_PATH = "/containers";
+const string API_PATH = "container";
 const string LEGACY_HOST = "metricshost";
 const Duration REQUEST_TIMEOUT = Seconds(5);
 
@@ -105,7 +105,7 @@ protected:
 "        {\"key\": \"dcos_metrics_service_address\",\n"
 "         \"value\": \"" + ip + ":" + port + "\"},\n"
 "        {\"key\": \"dcos_metrics_service_endpoint\",\n"
-"         \"value\": \"/" + path::join(METRICS_PROCESS, API_PATH) + "\"},\n"
+"         \"value\": \"/" + METRICS_PROCESS + "/" + API_PATH + "\"},\n"
 "        {\"key\": \"legacy_state_path_dir\",\n"
 "         \"value\": \"" + statePath + "\"},\n"
 "        {\"key\": \"request_timeout\",\n"
@@ -165,13 +165,13 @@ class MockMetricsServiceProcess
 public:
   MockMetricsServiceProcess() : ProcessBase(METRICS_PROCESS) {}
 
-  MOCK_METHOD1(containers, Future<process::http::Response>(
+  MOCK_METHOD1(container, Future<process::http::Response>(
       const process::http::Request&));
 
 protected:
   void initialize() override
   {
-    route(API_PATH, None(), &MockMetricsServiceProcess::containers);
+    route("/" + API_PATH, None(), &MockMetricsServiceProcess::container);
   }
 };
 
@@ -248,7 +248,7 @@ TEST_F(MetricsTest, PrepareSuccess)
       "application/json");
 
   Future<process::http::Request> request;
-  EXPECT_CALL(*metricsService.mock, containers(_))
+  EXPECT_CALL(*metricsService.mock, container(_))
     .WillOnce(DoAll(FutureArg<0>(&request),
                     Return(response)));
 
@@ -308,7 +308,7 @@ TEST_F(MetricsTest, PrepareFailureNoPort)
       process::http::Status::CREATED,
       "application/json");
 
-  EXPECT_CALL(*metricsService.mock, containers(_))
+  EXPECT_CALL(*metricsService.mock, container(_))
     .WillOnce(Return(response));
 
   const string CONTAINER_ID = "new-container";
@@ -339,7 +339,7 @@ TEST_F(MetricsTest, PrepareFailureUnexpectedStatusCode)
       process::http::Status::OK,
       "application/json");
 
-  EXPECT_CALL(*metricsService.mock, containers(_))
+  EXPECT_CALL(*metricsService.mock, container(_))
     .WillOnce(Return(response));
 
   const string CONTAINER_ID = "new-container";
@@ -370,7 +370,7 @@ TEST_F(MetricsTest, PrepareFailureRequestTimeout)
   Future<process::http::Response> response;
 
   Future<Nothing> requestSent;
-  EXPECT_CALL(*metricsService.mock, containers(_))
+  EXPECT_CALL(*metricsService.mock, container(_))
     .WillOnce(DoAll(FutureSatisfy(&requestSent),
                     Return(response)));
 
@@ -403,7 +403,7 @@ TEST_F(MetricsTest, CleanupSuccess)
   process::http::Response response(process::http::Status::ACCEPTED);
 
   Future<process::http::Request> request;
-  EXPECT_CALL(*metricsService.mock, containers(_))
+  EXPECT_CALL(*metricsService.mock, container(_))
     .WillOnce(DoAll(FutureArg<0>(&request),
                     Return(response)));
 
@@ -418,6 +418,13 @@ TEST_F(MetricsTest, CleanupSuccess)
 
   ASSERT_EQ(request->method, "DELETE");
 
+  // Verify that the DELETE request is made for a path which reflects the
+  // target container's ID.
+  const vector<string> pathTokens = strings::tokenize(request->url.path, "/");
+
+  ASSERT_EQ(pathTokens.size(), 3);
+  ASSERT_EQ(pathTokens[2], CONTAINER_ID);
+
   AWAIT_READY(cleanedup);
 }
 
@@ -431,7 +438,7 @@ TEST_F(MetricsTest, CleanupFailureUnexpectedStatusCode)
 
   process::http::Response response(process::http::Status::OK);
 
-  EXPECT_CALL(*metricsService.mock, containers(_))
+  EXPECT_CALL(*metricsService.mock, container(_))
     .WillOnce(Return(response));
 
   const string CONTAINER_ID = "new-container";
@@ -461,14 +468,21 @@ TEST_F(MetricsTest, RecoverSuccessWithLegacyState)
   // has been moved after recovery.
   ASSERT_TRUE(os::exists(path::join(statePath, "containers")));
 
-  process::http::Response response(process::http::Status::CREATED);
-
+  // In the recovery case, the metrics module doesn't use the returned host and
+  // port for anything. We inject some dummy values here to avoid addressing the
+  // fact that the order in which the requests is made is not certain.
   ContainerStartResponse responseBody;
-  response.body = string(jsonify(JSON::Protobuf(responseBody)));
+  responseBody.set_statsd_host("127.0.0.1");
+  responseBody.set_statsd_port(1234);
+
+  process::http::Response response(
+      string(jsonify(JSON::Protobuf(responseBody))),
+      process::http::Status::CREATED,
+      "application/json");
 
   Future<process::http::Request> request1;
   Future<process::http::Request> request2;
-  EXPECT_CALL(*metricsService.mock, containers(_))
+  EXPECT_CALL(*metricsService.mock, container(_))
     .WillOnce(DoAll(FutureArg<0>(&request1),
                     Return(response)))
     .WillOnce(DoAll(FutureArg<0>(&request2),
@@ -520,31 +534,9 @@ TEST_F(MetricsTest, RecoverSuccessWithLegacyState)
 }
 
 
-// When the isolator's `recover()` method is called and it finds no legacy
-// state on disk, it should make no API requests and return a ready future.
-TEST_F(MetricsTest, RecoverSuccessWithoutLegacyState)
-{
-  Clock::pause();
-
-  MockMetricsService metricsService;
-
-  EXPECT_CALL(*metricsService.mock, containers(_))
-    .Times(0);
-
-  vector<mesos::slave::ContainerState> agentState;
-
-  Future<Nothing> recovered = isolator->recover(agentState, {});
-
-  AWAIT_READY(recovered);
-
-  // Settle the clock to ensure that the metrics API is not called.
-  Clock::settle();
-}
-
-
-// When the isolator's `recover()` method is called and it finds no legacy
-// state on disk and no containers are passed to it for recovery, it should
-// return a ready future.
+// When the isolator's `recover()` method is called, the legacy state directory
+// has been set in the module configuration, but the state directory does not
+// exist, then the module should return a ready future.
 TEST_F(MetricsTest, RecoverSuccessWithoutLegacyDirectory)
 {
   Clock::pause();
@@ -553,7 +545,7 @@ TEST_F(MetricsTest, RecoverSuccessWithoutLegacyDirectory)
 
   os::rm(statePath);
 
-  EXPECT_CALL(*metricsService.mock, containers(_))
+  EXPECT_CALL(*metricsService.mock, container(_))
     .Times(0);
 
   vector<mesos::slave::ContainerState> agentState;
@@ -567,10 +559,64 @@ TEST_F(MetricsTest, RecoverSuccessWithoutLegacyDirectory)
 }
 
 
+// When the isolator's `recover()` method is called, the legacy state directory
+// has been set in the module configuration, the state directory exists, no
+// recovered containers are passed to the module, and the state directory is
+// empty as expected, then the module should return a ready future.
+TEST_F(MetricsTest, RecoverSuccessNoLegacyState)
+{
+  MockMetricsService metricsService;
+
+  EXPECT_CALL(*metricsService.mock, container(_))
+    .Times(0);
+
+  vector<mesos::slave::ContainerState> agentState;
+
+  Future<Nothing> recovered = isolator->recover(agentState, {});
+
+  AWAIT_READY(recovered);
+}
+
+
+// When the isolator's `recover()` method is called, the legacy state directory
+// has been set in the module configuration, the state directory exists,
+// recovered containers are passed to the module by the agent, but the state
+// directory is unexpectedly empty, the module should return a failed future.
+TEST_F(MetricsTest, RecoverFailureMissingLegacyState)
+{
+  Clock::pause();
+
+  MockMetricsService metricsService;
+
+  EXPECT_CALL(*metricsService.mock, container(_))
+    .Times(0);
+
+  vector<mesos::slave::ContainerState> agentState;
+
+  ContainerID containerId;
+  containerId.set_value("recovered-container");
+
+  mesos::slave::ContainerState containerState;
+
+  containerState.mutable_container_id()->CopyFrom(containerId);
+  containerState.set_pid(0);
+  containerState.set_directory(os::getcwd());
+
+  agentState.push_back(containerState);
+
+  Future<Nothing> recovered = isolator->recover(agentState, {});
+
+  AWAIT_FAILED(recovered);
+
+  // Settle the clock to ensure that the metrics API is not called.
+  Clock::settle();
+}
+
+
 // When the isolator's `recover()` method is called and it finds legacy state
 // on disk and subsequent requests to the metrics API return an unexpected
-// status code, it should return a ready future.
-TEST_F(MetricsTest, RecoverSuccessUnexpectedStatusCode)
+// status code, it should return a failed future.
+TEST_F(MetricsTest, RecoverFailureUnexpectedStatusCode)
 {
   MockMetricsService metricsService;
 
@@ -588,7 +634,7 @@ TEST_F(MetricsTest, RecoverSuccessUnexpectedStatusCode)
   response.body = string(jsonify(JSON::Protobuf(responseBody)));
 
   Future<process::http::Request> request;
-  EXPECT_CALL(*metricsService.mock, containers(_))
+  EXPECT_CALL(*metricsService.mock, container(_))
     .WillOnce(DoAll(FutureArg<0>(&request),
                     Return(response)));
 
@@ -611,9 +657,9 @@ TEST_F(MetricsTest, RecoverSuccessUnexpectedStatusCode)
 
   Future<Nothing> recovered = isolator->recover(agentState, {});
 
-  AWAIT_READY(recovered);
+  AWAIT_FAILED(recovered);
 
-  ASSERT_FALSE(os::exists(path::join(statePath, "containers")));
+  ASSERT_TRUE(os::exists(path::join(statePath, "containers")));
 }
 
 } // namespace tests {
