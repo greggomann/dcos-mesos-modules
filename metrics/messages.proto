@@ -12,7 +12,7 @@ message ContainerStartRequest {
   // container. This is required to support upgrading from a 1.11 to a
   // 1.12 DC/OS cluster because the 1.11 module used to persist this
   // data. It will only be included in this message during `recovery`
-  // aftr an upgrade to inform the DC/OS metrics service about
+  // after an upgrade to inform the DC/OS metrics service about
   // already-running containers that push metrics to a specific
   // host:port pair. After `recovery` from the upgrade is complete,
   // the new metrics service will own the perisistence of this
